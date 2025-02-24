@@ -6,10 +6,11 @@ use crate::messages::position_report::PositionReport;
 use axum::extract::Path;
 use axum::{extract, http::StatusCode, routing::get, Json, Router};
 use extract::State;
+use futures::stream::StreamExt;
 use log::info;
 use mongodb::bson::doc;
 use mongodb::options::ClientOptions;
-use mongodb::{Client, Collection};
+use mongodb::{bson, Client, Collection};
 use serde_env::from_env;
 
 #[tokio::main]
@@ -36,6 +37,7 @@ fn app(client: Client) -> Router {
     Router::new()
         .route("/hello", get(hello_handler))
         .route("/ship/{id}", get(fetch_ship_handler))
+        .route("/ships", get(fetch_unique_ships_handler))
         .with_state(collection)
 }
 
@@ -48,7 +50,6 @@ async fn fetch_ship_handler(
     State(collection): State<Collection<PositionReport>>,
     Path(id): Path<u32>,
 ) -> Result<Json<Option<PositionReport>>, (StatusCode, String)> {
-
     info!("fetching ship with MMSI: {}", id);
 
     let result = collection
@@ -57,6 +58,34 @@ async fn fetch_ship_handler(
         .map_err(internal_error)?;
 
     Ok(Json(result))
+}
+
+async fn fetch_unique_ships_handler(
+    State(collection): State<Collection<PositionReport>>,
+) -> Result<Json<Vec<PositionReport>>, (StatusCode, String)> {
+    info!("fetching unique ships");
+
+    let aggregates = vec![
+        doc! { "$sort": doc! { "MetaData.time_utc": -1 } },
+        doc! { "$group": doc! { "_id": "$MetaData.MMSI", "document": doc! {"$first" : "$$ROOT"} } },
+        doc! { "$replaceRoot": doc! { "newRoot": "$document" } },
+        doc! { "$limit" : 10},
+    ];
+
+    let mut cursor = collection
+        .aggregate(aggregates)
+        .await
+        .map_err(internal_error)?;
+
+    let mut results = Vec::new();
+    while let Some(doc) = cursor.next().await {
+        match bson::from_document::<PositionReport>(doc.map_err(internal_error)?) {
+            Ok(report) => results.push(report),
+            Err(e) => return Err(internal_error(e)),
+        }
+    }
+
+    Ok(Json(results))
 }
 
 fn internal_error<E>(err: E) -> (StatusCode, String)
